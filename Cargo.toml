@@ -4,5 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-#onecode = { git = "https://github.com/pangenome/onecode-rs" }
-onecode = { path = "/home/guarracino/git/onecode-rs"}
+onecode = { git = "https://github.com/pangenome/onecode-rs" }
+#onecode = { path = "/home/guarracino/git/onecode-rs"} # it works
+
+clap = { version = "4.5.49", features = ["derive"] }
