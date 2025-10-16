@@ -134,39 +134,21 @@ fn read_single_alignment(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut file = OneFile::open_read(path, None, None, 1)?;
     
-    // Try O(1) access first, fall back to sequential scan
-    let aln = if file.goto('A', (idx + 1) as i64).is_ok() {
-        eprintln!("Using O(1) binary index to jump to alignment {}", idx);
-        file.read_line(); // Read the 'A' line we jumped to
-        parse_alignment(&mut file, metadata)?
-    } else {
-        eprintln!("Binary index unavailable, scanning sequentially to alignment {}...", idx);
-        find_nth_alignment(&mut file, idx, metadata)?
-    };
+    // Require O(1) access via binary index
+    if file.goto('A', (idx + 1) as i64).is_err() {
+        return Err(format!(
+            "Cannot access alignment {} directly. Binary index not available for this file.\n\
+             Please ensure the file has an associated .1idx index file.",
+            idx
+        ).into());
+    }
+    
+    eprintln!("Using O(1) binary index to jump to alignment {}", idx);
+    file.read_line(); // Read the 'A' line we jumped to
+    let aln = parse_alignment(&mut file, metadata)?;
     
     print_alignment(&aln, trace_spacing)?;
     Ok(())
-}
-
-fn find_nth_alignment(
-    file: &mut OneFile,
-    target_idx: usize,
-    metadata: &FileMetadata,
-) -> Result<AlignmentData, Box<dyn std::error::Error>> {
-    let mut current_idx = 0;
-    
-    loop {
-        match file.read_line() {
-            '\0' => return Err(format!("Alignment {} not found", target_idx).into()),
-            'A' => {
-                if current_idx == target_idx {
-                    return parse_alignment(file, metadata);
-                }
-                current_idx += 1;
-            }
-            _ => {}
-        }
-    }
 }
 
 fn read_all_alignments(
