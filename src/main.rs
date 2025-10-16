@@ -1,6 +1,5 @@
 use onecode::OneFile;
 use std::collections::HashMap;
-use std::fs;
 use std::io::{self, Write};
 use clap::Parser;
 
@@ -22,7 +21,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let file_path = &args.input;
     
     if let Some(aln_idx) = args.alignment {
-        // Read specific alignment - try O(1) binary access first
+        // Read specific alignment
         read_single_alignment(file_path, aln_idx)?;
     } else {
         // Read all alignments sequentially
@@ -32,7 +31,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Read a single alignment using O(1) access for binary files
+/// Read a single alignment using O(1) access for binary files, sequential scan for ASCII
 fn read_single_alignment(
     file_path: &str,
     aln_idx: usize,
@@ -46,37 +45,18 @@ fn read_single_alignment(
     // Get trace spacing from header
     let trace_spacing = get_trace_spacing(&mut file)?;
     
+    // Reopen to reset position
+    drop(file);
+    let mut file = OneFile::open_read(file_path, None, None, 1)?;
+    
     // Try O(1) binary index access (ONEcode uses 1-based indexing)
     let aln = if file.goto('A', (aln_idx + 1) as i64).is_ok() {
         eprintln!("Using O(1) binary index to jump to alignment {}", aln_idx);
         read_alignment_at_current_position(&mut file, &seq_names, &seq_lengths)?
     } else {
-        // Fall back to line-number-based index for ASCII files
-        eprintln!("Binary index unavailable, building line-number index...");
-        drop(file); // Close and reopen
-        
-        let index_path = format!("{}.idx", file_path);
-        let index = if std::path::Path::new(&index_path).exists() {
-            eprintln!("Loading existing index from {}", index_path);
-            load_index(&index_path)?
-        } else {
-            eprintln!("Building alignment index...");
-            let index = build_alignment_index(file_path)?;
-            save_index(&index, &index_path)?;
-            eprintln!("Saved index with {} alignments to {}", 
-                index.line_numbers.len(), index_path);
-            index
-        };
-        
-        if aln_idx >= index.line_numbers.len() {
-            eprintln!("Error: Alignment {} out of range (max {})", 
-                aln_idx, index.line_numbers.len() - 1);
-            std::process::exit(1);
-        }
-        
-        let mut file = OneFile::open_read(file_path, None, None, 1)?;
-        read_alignment_at_line(&mut file, index.line_numbers[aln_idx], 
-                              &seq_names, &seq_lengths)?
+        // Fall back to sequential scan for ASCII files
+        eprintln!("Binary index unavailable, scanning sequentially to alignment {}...", aln_idx);
+        read_alignment_by_sequential_scan(&mut file, aln_idx, &seq_names, &seq_lengths)?
     };
     
     print_alignment_stdout(&aln, trace_spacing)?;
@@ -191,6 +171,92 @@ fn read_alignment_at_current_position(
     Ok(aln)
 }
 
+/// Read N-th alignment by sequential scan (for ASCII files without index)
+fn read_alignment_by_sequential_scan(
+    file: &mut OneFile,
+    target_idx: usize,
+    seq_names: &HashMap<i64, String>,
+    seq_lengths: &HashMap<i64, i64>,
+) -> Result<AlignmentData, Box<dyn std::error::Error>> {
+    let mut current_idx = 0;
+    
+    loop {
+        let line_type = file.read_line();
+        
+        if line_type == '\0' {
+            return Err(format!("Alignment {} not found (only {} alignments in file)", 
+                target_idx, current_idx).into());
+        }
+        
+        if line_type == 'A' {
+            if current_idx == target_idx {
+                // Found it! Now read the alignment data
+                let query_id = file.int(0);
+                let query_start = file.int(1);
+                let query_end = file.int(2);
+                let target_id = file.int(3);
+                let target_start = file.int(4);
+                let target_end = file.int(5);
+                
+                let query_name = seq_names.get(&query_id)
+                    .map(|s| s.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let target_name = seq_names.get(&target_id)
+                    .map(|s| s.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                
+                let query_length = seq_lengths.get(&query_id).copied().unwrap_or(0);
+                let target_length = seq_lengths.get(&target_id).copied().unwrap_or(0);
+                
+                let mut aln = AlignmentData {
+                    query_name,
+                    query_length,
+                    query_start,
+                    query_end,
+                    target_name,
+                    target_length,
+                    target_start,
+                    target_end,
+                    strand: '+',
+                    differences: 0,
+                    tracepoints: Vec::new(),
+                    trace_diffs: Vec::new(),
+                };
+                
+                // Read associated lines (R, D, T, X)
+                loop {
+                    let line_type = file.read_line();
+                    
+                    if line_type == '\0' || line_type == 'A' || line_type == 'a' || line_type == 'g' {
+                        break;
+                    }
+                    
+                    match line_type {
+                        'R' => aln.strand = '-',
+                        'D' => aln.differences = file.int(0),
+                        'T' => {
+                            if let Some(tracepoints) = file.int_list() {
+                                aln.tracepoints = tracepoints.to_vec();
+                            }
+                        }
+                        'X' => {
+                            if let Some(trace_diffs) = file.int_list() {
+                                aln.trace_diffs = trace_diffs.to_vec();
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                
+                return Ok(aln);
+            }
+            current_idx += 1;
+        }
+    }
+}
+
 /// Read all alignments sequentially (efficient for full file scan)
 fn read_all_alignments_sequential(
     file: &mut OneFile,
@@ -284,105 +350,6 @@ fn read_all_alignments_sequential(
     }
     
     Ok(())
-}
-
-// === Index-based fallback for ASCII files ===
-
-struct AlignmentIndex {
-    line_numbers: Vec<i64>,
-    trace_spacing: i64,
-}
-
-fn save_index(index: &AlignmentIndex, path: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let mut content = String::new();
-    content.push_str(&format!("{}\n", index.trace_spacing));
-    content.push_str(&format!("{}\n", index.line_numbers.len()));
-    
-    for &line_num in &index.line_numbers {
-        content.push_str(&format!("{}\n", line_num));
-    }
-    
-    fs::write(path, content)?;
-    Ok(())
-}
-
-fn load_index(path: &str) -> Result<AlignmentIndex, Box<dyn std::error::Error>> {
-    let content = fs::read_to_string(path)?;
-    let mut lines = content.lines();
-    
-    let trace_spacing = lines.next()
-        .ok_or("Missing trace_spacing in index")?
-        .parse()?;
-    
-    let num_alignments: usize = lines.next()
-        .ok_or("Missing num_alignments in index")?
-        .parse()?;
-    
-    let mut line_numbers = Vec::with_capacity(num_alignments);
-    
-    for line in lines {
-        let line_num: i64 = line.trim().parse()?;
-        line_numbers.push(line_num);
-    }
-    
-    if line_numbers.len() != num_alignments {
-        return Err(format!("Expected {} alignments, found {}", 
-            num_alignments, line_numbers.len()).into());
-    }
-    
-    Ok(AlignmentIndex {
-        line_numbers,
-        trace_spacing,
-    })
-}
-
-fn build_alignment_index(file_path: &str) -> Result<AlignmentIndex, Box<dyn std::error::Error>> {
-    let mut file = OneFile::open_read(file_path, None, None, 1)?;
-    
-    let mut trace_spacing = 100;
-    let mut line_numbers = Vec::new();
-    
-    loop {
-        let line_type = file.read_line();
-        
-        if line_type == '\0' {
-            break;
-        }
-        
-        if line_type == 't' {
-            trace_spacing = file.int(0);
-        } else if line_type == 'A' {
-            line_numbers.push(file.line_number());
-        }
-    }
-    
-    Ok(AlignmentIndex {
-        line_numbers,
-        trace_spacing,
-    })
-}
-
-fn read_alignment_at_line(
-    file: &mut OneFile,
-    target_line: i64,
-    seq_names: &HashMap<i64, String>,
-    seq_lengths: &HashMap<i64, i64>,
-) -> Result<AlignmentData, Box<dyn std::error::Error>> {
-    loop {
-        let line_type = file.read_line();
-        
-        if line_type == '\0' {
-            return Err("Reached EOF before target line".into());
-        }
-        
-        if file.line_number() == target_line {
-            if line_type != 'A' {
-                return Err(format!("Expected 'A' at line {}, got '{}'", target_line, line_type).into());
-            }
-            
-            return read_alignment_at_current_position(file, seq_names, seq_lengths);
-        }
-    }
 }
 
 // === Data structures and output ===
