@@ -1,0 +1,8 @@
+[package]
+name = "oneview-rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+#onecode = { git = "https://github.com/pangenome/onecode-rs" }
+onecode = { path = "/home/guarracino/git/onecode-rs"}
