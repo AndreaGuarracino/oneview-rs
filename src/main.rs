@@ -93,7 +93,7 @@ fn print_metadata(
     let stdout = io::stdout();
     let mut handle = stdout.lock();
     
-    writeln!(handle, "=== FILE METADATA ===\n")?;
+    writeln!(handle, "=== METADATA ===\n")?;
     writeln!(handle, "File: {}", path)?;
     writeln!(handle, "Trace spacing: {}", trace_spacing)?;
     writeln!(handle, "Number of sequences: {}", metadata.seq_names.len())?;
