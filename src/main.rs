@@ -133,7 +133,7 @@ fn read_single_alignment(
     trace_spacing: i64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut file = OneFile::open_read(path, None, None, 1)?;
-    
+
     // Require O(1) access via binary index
     if file.goto('A', (idx + 1) as i64).is_err() {
         return Err(format!(
@@ -142,11 +142,11 @@ fn read_single_alignment(
             idx
         ).into());
     }
-    
+
     eprintln!("Using O(1) binary index to jump to alignment {}", idx);
     file.read_line(); // Read the 'A' line we jumped to
-    let aln = parse_alignment(&mut file, metadata)?;
-    
+    let (aln, _) = parse_alignment(&mut file, metadata)?;
+
     print_alignment(&aln, trace_spacing)?;
     Ok(())
 }
@@ -157,15 +157,19 @@ fn read_all_alignments(
     trace_spacing: i64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut file = OneFile::open_read(path, None, None, 1)?;
-    
+
+    let mut current_line = file.read_line();
     loop {
-        match file.read_line() {
+        match current_line {
             '\0' => break,
             'A' => {
-                let aln = parse_alignment(&mut file, metadata)?;
+                let (aln, next_line) = parse_alignment(&mut file, metadata)?;
                 print_alignment(&aln, trace_spacing)?;
+                current_line = next_line;
             }
-            _ => {}
+            _ => {
+                current_line = file.read_line();
+            }
         }
     }
     Ok(())
@@ -174,11 +178,11 @@ fn read_all_alignments(
 fn parse_alignment(
     file: &mut OneFile,
     metadata: &FileMetadata,
-) -> Result<AlignmentData, Box<dyn std::error::Error>> {
+) -> Result<(AlignmentData, char), Box<dyn std::error::Error>> {
     // Read alignment coordinates from current 'A' line
     let query_id = file.int(0);
     let target_id = file.int(3);
-    
+
     let mut aln = AlignmentData {
         query_name: metadata.seq_names.get(&query_id)
             .cloned().unwrap_or_else(|| "unknown".to_string()),
@@ -193,20 +197,21 @@ fn parse_alignment(
         strand: '+',
         ..Default::default()
     };
-    
+
     // Read associated lines
-    loop {
-        match file.read_line() {
+    let next_line = loop {
+        let line_type = file.read_line();
+        match line_type {
             'R' => aln.strand = '-',
             'D' => aln.differences = file.int(0),
             'T' => aln.tracepoints = file.int_list().map(|v| v.to_vec()).unwrap_or_default(),
             'X' => aln.trace_diffs = file.int_list().map(|v| v.to_vec()).unwrap_or_default(),
-            'A' | 'a' | 'g' | '\0' => break,
+            'A' | 'a' | 'g' | '\0' => break line_type,
             _ => {}
         }
-    }
-    
-    Ok(aln)
+    };
+
+    Ok((aln, next_line))
 }
 
 fn print_alignment(aln: &AlignmentData, trace_spacing: i64) -> io::Result<()> {
