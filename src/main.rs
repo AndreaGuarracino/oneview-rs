@@ -211,6 +211,14 @@ fn parse_alignment(
         }
     };
 
+    if matches!(aln.strand, '-' | '\'') {
+        let orig_start = aln.target_start;
+        let orig_end = aln.target_end;
+        // Reverse-complement target coordinates so start/end reflect forward strand
+        aln.target_start = aln.target_length - orig_end;
+        aln.target_end = aln.target_length - orig_start;
+    }
+
     Ok((aln, next_line))
 }
 
@@ -218,12 +226,10 @@ fn print_alignment(aln: &AlignmentData, trace_spacing: i64) -> io::Result<()> {
     let stdout = io::stdout();
     let mut handle = stdout.lock();
     
-    writeln!(handle, "Query: {} (len={}) {}:{}-{}", 
-        aln.query_name, aln.query_length, aln.query_name, 
-        aln.query_start, aln.query_end)?;
-    writeln!(handle, "Target: {} (len={}) {}:{}-{}", 
-        aln.target_name, aln.target_length, aln.target_name, 
-        aln.target_start, aln.target_end)?;
+    writeln!(handle, "Query: {}:{}-{}, query total length: {}", 
+        aln.query_name, aln.query_start, aln.query_end, aln.query_length)?;
+    writeln!(handle, "Target: {}:{}-{}, target total length: {}", 
+        aln.target_name, aln.target_start, aln.target_end, aln.target_length)?;
     writeln!(handle, "Strand: {}", aln.strand)?;
     writeln!(handle, "Differences: {}", aln.differences)?;
     writeln!(handle, "Trace spacing: {}", trace_spacing)?;
