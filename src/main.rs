@@ -18,6 +18,10 @@ struct Args {
     /// Print only file metadata (sequences and trace spacing)
     #[arg(short, long)]
     metadata: bool,
+
+    /// Emit alignments in PAF format
+    #[arg(long)]
+    paf: bool,
 }
 
 #[derive(Debug, Default)]
@@ -38,6 +42,16 @@ struct AlignmentData {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+
+    if args.metadata && args.paf {
+        return Err("Cannot combine --metadata with --paf output".into());
+    }
+
+    let output_format = if args.paf {
+        OutputFormat::Paf
+    } else {
+        OutputFormat::Human
+    };
     
     let (metadata, trace_spacing) = get_file_metadata(&args.input)?;
     
@@ -48,13 +62,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         (false, Some(idx)) => {
             // Only specific alignment
-            read_single_alignment(&args.input, idx, &metadata, trace_spacing)?;
+            read_single_alignment(
+                &args.input,
+                idx,
+                &metadata,
+                trace_spacing,
+                output_format,
+            )?;
         }
         (false, None) => {
             // Default: metadata + all alignments
-            print_metadata(&metadata, trace_spacing, &args.input)?;
-            writeln!(io::stdout(), "\n=== ALIGNMENTS ===\n")?;
-            read_all_alignments(&args.input, &metadata, trace_spacing)?;
+            if output_format == OutputFormat::Human {
+                print_metadata(&metadata, trace_spacing, &args.input)?;
+                writeln!(io::stdout(), "\n=== ALIGNMENTS ===\n")?;
+            }
+            read_all_alignments(
+                &args.input,
+                &metadata,
+                trace_spacing,
+                output_format,
+            )?;
         }
     }
     Ok(())
@@ -126,11 +153,18 @@ fn print_metadata(
     Ok(())
 }
 
+#[derive(Copy, Clone, Eq, PartialEq)]
+enum OutputFormat {
+    Human,
+    Paf,
+}
+
 fn read_single_alignment(
     path: &str,
     idx: usize,
     metadata: &FileMetadata,
     trace_spacing: i64,
+    format: OutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut file = OneFile::open_read(path, None, None, 1)?;
 
@@ -147,7 +181,7 @@ fn read_single_alignment(
     file.read_line(); // Read the 'A' line we jumped to
     let (aln, _) = parse_alignment(&mut file, metadata)?;
 
-    print_alignment(&aln, trace_spacing)?;
+    print_alignment(&aln, trace_spacing, format)?;
     Ok(())
 }
 
@@ -155,6 +189,7 @@ fn read_all_alignments(
     path: &str,
     metadata: &FileMetadata,
     trace_spacing: i64,
+    format: OutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut file = OneFile::open_read(path, None, None, 1)?;
 
@@ -164,7 +199,7 @@ fn read_all_alignments(
             '\0' => break,
             'A' => {
                 let (aln, next_line) = parse_alignment(&mut file, metadata)?;
-                print_alignment(&aln, trace_spacing)?;
+                print_alignment(&aln, trace_spacing, format)?;
                 current_line = next_line;
             }
             _ => {
@@ -183,15 +218,44 @@ fn parse_alignment(
     let query_id = file.int(0);
     let target_id = file.int(3);
 
+    let query_name = metadata
+        .seq_names
+        .get(&query_id)
+        .cloned()
+        .ok_or_else(|| format!("Query sequence with ID {} not found in metadata", query_id))?;
+    let target_name = metadata
+        .seq_names
+        .get(&target_id)
+        .cloned()
+        .ok_or_else(|| format!("Target sequence with ID {} not found in metadata", target_id))?;
+    let query_length = metadata
+        .seq_lengths
+        .get(&query_id)
+        .copied()
+        .ok_or_else(|| {
+            format!(
+                "Query sequence length for ID {} not found in metadata",
+                query_id
+            )
+        })?;
+    let target_length = metadata
+        .seq_lengths
+        .get(&target_id)
+        .copied()
+        .ok_or_else(|| {
+            format!(
+                "Target sequence length for ID {} not found in metadata",
+                target_id
+            )
+        })?;
+
     let mut aln = AlignmentData {
-        query_name: metadata.seq_names.get(&query_id)
-            .cloned().unwrap_or_else(|| "unknown".to_string()),
-        query_length: metadata.seq_lengths.get(&query_id).copied().unwrap_or(0),
+        query_name,
+        query_length,
         query_start: file.int(1),
         query_end: file.int(2),
-        target_name: metadata.seq_names.get(&target_id)
-            .cloned().unwrap_or_else(|| "unknown".to_string()),
-        target_length: metadata.seq_lengths.get(&target_id).copied().unwrap_or(0),
+        target_name,
+        target_length,
         target_start: file.int(4),
         target_end: file.int(5),
         strand: '+',
@@ -206,7 +270,7 @@ fn parse_alignment(
             'D' => aln.differences = file.int(0),
             'T' => aln.tracepoints = file.int_list().map(|v| v.to_vec()).unwrap_or_default(),
             'X' => aln.trace_diffs = file.int_list().map(|v| v.to_vec()).unwrap_or_default(),
-            'A' | 'a' | 'g' | '\0' => break line_type,
+            'A' | 'a' | 'g' | 'S' | '^' | '\0' => break line_type,
             _ => {}
         }
     };
@@ -222,7 +286,14 @@ fn parse_alignment(
     Ok((aln, next_line))
 }
 
-fn print_alignment(aln: &AlignmentData, trace_spacing: i64) -> io::Result<()> {
+fn print_alignment(aln: &AlignmentData, trace_spacing: i64, format: OutputFormat) -> io::Result<()> {
+    match format {
+        OutputFormat::Human => print_alignment_human(aln, trace_spacing),
+        OutputFormat::Paf => print_alignment_paf(aln),
+    }
+}
+
+fn print_alignment_human(aln: &AlignmentData, trace_spacing: i64) -> io::Result<()> {
     let stdout = io::stdout();
     let mut handle = stdout.lock();
     
@@ -236,7 +307,55 @@ fn print_alignment(aln: &AlignmentData, trace_spacing: i64) -> io::Result<()> {
     
     print_trace_data(&mut handle, "Tracepoints", &aln.tracepoints)?;
     print_trace_data(&mut handle, "Trace diffs", &aln.trace_diffs)?;
-    
+
+    writeln!(handle)?;
+    Ok(())
+}
+
+fn print_alignment_paf(aln: &AlignmentData) -> io::Result<()> {
+    let stdout = io::stdout();
+    let mut handle = stdout.lock();
+
+    let query_span = (aln.query_end - aln.query_start).max(0);
+    let target_span = (aln.target_end - aln.target_start).max(0);
+    let block_length = query_span.max(target_span);
+    let matches = (block_length - aln.differences).max(0);
+    let mapq = 255;
+
+    write!(
+        handle,
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        aln.query_name,
+        aln.query_length,
+        aln.query_start,
+        aln.query_end,
+        aln.strand,
+        aln.target_name,
+        aln.target_length,
+        aln.target_start,
+        aln.target_end,
+        matches,
+        block_length,
+        mapq
+    )?;
+
+    write!(handle, "\tdf:i:{}", aln.differences)?;
+
+    let tp_pairs = if !aln.trace_diffs.is_empty() && !aln.tracepoints.is_empty() {
+        let pair_count = aln.trace_diffs.len().min(aln.tracepoints.len());
+        aln.trace_diffs
+            .iter()
+            .zip(aln.tracepoints.iter())
+            .take(pair_count)
+            .map(|(&diff, &tp)| format!("{},{}", diff, tp))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    if !tp_pairs.is_empty() {
+        write!(handle, "\ttp:Z:{}", tp_pairs.join(";"))?;
+    }
+
     writeln!(handle)?;
     Ok(())
 }
