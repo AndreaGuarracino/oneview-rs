@@ -90,6 +90,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 struct FileMetadata {
     seq_names: HashMap<i64, String>,
     seq_lengths: HashMap<i64, i64>,
+    contig_offsets: HashMap<i64, (i64, i64)>,
 }
 
 fn get_file_metadata(path: &str) -> Result<(FileMetadata, i64), Box<dyn std::error::Error>> {
@@ -97,6 +98,7 @@ fn get_file_metadata(path: &str) -> Result<(FileMetadata, i64), Box<dyn std::err
     let metadata = FileMetadata {
         seq_names: file.get_all_sequence_names(),
         seq_lengths: file.get_all_sequence_lengths(),
+        contig_offsets: file.get_all_contig_offsets(),
     };
     
     // Get trace spacing
@@ -249,15 +251,42 @@ fn parse_alignment(
             )
         })?;
 
+    let (query_offset, _) = metadata
+        .contig_offsets
+        .get(&query_id)
+        .copied()
+        .ok_or_else(|| {
+            format!(
+                "Contig offset for query sequence ID {} not found in metadata",
+                query_id
+            )
+        })?;
+
+    let (target_offset, target_contig_len) = metadata
+        .contig_offsets
+        .get(&target_id)
+        .copied()
+        .ok_or_else(|| {
+            format!(
+                "Contig offset for target sequence ID {} not found in metadata",
+                target_id
+            )
+        })?;
+
+    let query_contig_start = file.int(1);
+    let query_contig_end = file.int(2);
+    let mut target_contig_start = file.int(4);
+    let mut target_contig_end = file.int(5);
+
     let mut aln = AlignmentData {
         query_name,
         query_length,
-        query_start: file.int(1),
-        query_end: file.int(2),
+        query_start: 0,
+        query_end: 0,
         target_name,
         target_length,
-        target_start: file.int(4),
-        target_end: file.int(5),
+        target_start: 0,
+        target_end: 0,
         strand: '+',
         ..Default::default()
     };
@@ -276,14 +305,25 @@ fn parse_alignment(
     };
 
     if matches!(aln.strand, '-' | '\'') {
-        let orig_start = aln.target_start;
-        let orig_end = aln.target_end;
+        let orig_start = target_contig_start;
+        let orig_end = target_contig_end;
         // Reverse-complement target coordinates so start/end reflect forward strand
-        aln.target_start = aln.target_length - orig_end;
-        aln.target_end = aln.target_length - orig_start;
+        target_contig_start = target_contig_len - orig_end;
+        target_contig_end = target_contig_len - orig_start;
     }
 
+    aln.query_start = add_offset(query_offset, query_contig_start)?;
+    aln.query_end = add_offset(query_offset, query_contig_end)?;
+    aln.target_start = add_offset(target_offset, target_contig_start)?;
+    aln.target_end = add_offset(target_offset, target_contig_end)?;
+
     Ok((aln, next_line))
+}
+
+fn add_offset(offset: i64, position: i64) -> Result<i64, Box<dyn std::error::Error>> {
+    offset
+        .checked_add(position)
+        .ok_or_else(|| "Coordinate overflow when applying contig offset".into())
 }
 
 fn print_alignment(aln: &AlignmentData, trace_spacing: i64, format: OutputFormat) -> io::Result<()> {
