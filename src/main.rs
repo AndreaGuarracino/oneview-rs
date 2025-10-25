@@ -574,8 +574,10 @@ fn print_alignment_paf(aln: &AlignmentData) -> io::Result<()> {
 
     let query_span = (aln.query_end - aln.query_start).max(0);
     let target_span = (aln.target_end - aln.target_start).max(0);
-    let block_length = query_span.max(target_span);
-    let matches = (block_length - aln.differences).max(0);
+
+    // Match ALNtoPAF calculation (when not computing CIGAR):
+    let block_length = query_span + target_span;
+    let matches = ((block_length - aln.differences) / 2).max(0);
     let mapq = 255;
 
     write!(
